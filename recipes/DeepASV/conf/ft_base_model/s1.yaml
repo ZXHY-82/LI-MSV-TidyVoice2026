@@ -1,0 +1,75 @@
+seed: 24
+__set_seed: !apply:deeplab.utils.misc.set_random_seed [!ref <seed>]
+
+use_amp: true
+use_gradient_clipping: true
+gradient_accumulation: 1
+cudnn_benchmark: false
+
+
+optimizer: !name:torch.optim.AdamW
+    lr: 0.0001
+    weight_decay: 0.0001
+
+scheduler: !name:deeplab.core.scheduler.WarmupLR_withStepDecay
+    warmup_step: 0
+    decay_step: 5
+    gamma: 0.1
+
+num_epochs: 10
+max_iters_per_epoch: null
+batch_size: 32
+valid_batch_size: 1
+training_loop: 1
+num_workers: 16
+output_dir: results/
+
+items_save: False
+item_save_steps: 300
+
+dur_range: [2, 3]
+max_valid_dur: 60
+speed_perturbation: []
+data_aug: true
+embd_dim: 256
+
+sample_rate: 16000
+normalize_input: 'none'
+
+corpus_dir: /work/zl389/AudioData
+
+musan_path: !apply:os.path.join [!ref <corpus_dir>, 'musan'] 
+rirs_path:  !apply:os.path.join [!ref <corpus_dir>, 'rirs_noise'] 
+
+train_data:
+    - !name:deeplab.utils.corpus.load_audio_corpus
+        ['/work/zl389/workspace/LLM_ASV/data/ASV_data', ['TV2026_train']] # 3666
+
+train_utt2lang: '/work/zl389/workspace/LLM_ASV/data/TidyVoice/train/utt2lang'
+test_utt2lang: '/work/zl389/workspace/LLM_ASV/data/TidyVoice/dev/utt2lang'
+
+valid_data:
+    - scp_path: '/work/zl389/workspace/LLM_ASV/data/TidyVoice/dev/wav.scp'
+      trial_path: '/work/zl389/workspace/LLM_ASV/data/TidyVoice/dev/TidyVocieX_Dev_trialPairs.txt'
+
+
+peft_config: null
+
+spk_model: !new:local.spk_model.Audio2Vec_based_Adapter_Language
+    model_name: 'facebook/w2v-bert-2.0'
+    frozen_encoder: True
+    bnb_config: null
+    peft_config: !ref <peft_config>
+    encoder_config: 'config_tea.json'
+    n_mfa_layers: -1
+    pooling_layer: 'ASP' 
+    embd_dim: !ref <embd_dim> 
+    adapter_dim: 128
+    dropout: 0.0
+    spk_embd: True
+    frozen_spkmodel: True
+    GRL: False
+    lang_num: 40
+
+modules: 
+    spk_model: !ref <spk_model>

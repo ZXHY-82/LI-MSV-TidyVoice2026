@@ -1,0 +1,182 @@
+# encoding: utf-8
+import os, sys, argparse, traceback
+sys.path.append('../..')
+sys.path.append('../../deeplab/pretrained/audio2vector/module/transformers/src')
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import uuid
+import tempfile
+from sklearn.metrics import accuracy_score
+from deeplab.core.trainer import Trainer
+from deeplab.metric.eer import get_eer
+from deeplab.utils.fileio import save_trial
+from local.dataset_lang import Train_Dataset, Valid_Dataset
+from local.sampler import WavBatchSampler
+from tqdm import tqdm
+
+class LocalTrainer(Trainer):
+
+    def prep(self, hparams):
+        self.train_dataset = Train_Dataset(hparams)
+        self.valid_dataset = Valid_Dataset(hparams)
+
+        self.train_batch_sampler = WavBatchSampler(
+            self.train_dataset, 
+            hparams['dur_range'], 
+            shuffle=True, 
+            batch_size=hparams['batch_size'], 
+            drop_last=True, 
+            distributed=self.is_distributed,
+            )
+        self.valid_batch_sampler = WavBatchSampler(
+            self.valid_dataset,
+            shuffle=False,
+            batch_size=hparams['valid_batch_size'],
+            drop_last=False,
+            distributed=self.is_distributed,
+            )
+
+        self.modules = hparams['modules']
+        self.embd_dim = hparams['embd_dim']
+        self.dtype = torch.bfloat16 if hparams['use_amp'] else torch.float32
+
+        self.logging_config = {
+            'loss_spk':dict(decimal=4, visible=True),
+            'loss_lang':dict(decimal=4, visible=True),
+            'lr':dict(decimal=8, visible=True, instant=True),
+            'spk_acc':dict(decimal=4, visible=True),
+            'lang_acc':dict(decimal=4, visible=True),
+            'eer':dict(decimal=4, visible=True),
+            'dev_acc':dict(decimal=4, visible=True),
+            }
+
+        num_spks = len(self.train_dataset.spk_ids)
+        num_utts = len(self.train_dataset.utt_list)
+        if hparams['speed_perturbation'] is not None:
+            num_spks += num_spks * len(hparams['speed_perturbation'])
+
+        # assert len(self.modules['classifier'])==num_spks, 'Length of classifier must be equal to: ({}).'.format(num_spks)
+        self.print('INFO: Num. Spks: {}'.format(num_spks))
+        self.print('INFO: Num. Utts: {}'.format(num_utts))
+        if hparams['speed_perturbation'] is not None:
+            self.print('INFO: Speed Perturbation: ', hparams['speed_perturbation'])
+       
+        self.lang_loss_lambda = hparams['lang_loss_lambda']
+
+    def compute_forward(self, inputs, stage):
+        emb_output, lang_output = self.modules['spk_model'](inputs['aud_inputs'])
+        
+        if len(emb_output.shape) == 3:
+            bsz, seqlen, _ = emb_output.shape
+            emb_output = emb_output.reshape(bsz * seqlen, -1)
+            inputs['spk_labels'] = inputs['spk_labels'].unsqueeze(1).repeat(1, seqlen).reshape(bsz * seqlen)
+
+        spk_output, spk_loss_output = self.modules['classifier'](input=emb_output, label=inputs['spk_labels'])
+        lang_loss = F.cross_entropy(input=lang_output, target=inputs['lang_labels']) * self.lang_loss_lambda
+
+        predictions = {'emb_output':emb_output, 'spk_output':spk_output, 'lang_output':lang_output,  'spk_loss_output':spk_loss_output, 'lang_loss':lang_loss}
+
+        return predictions
+
+    
+    def loss_fn(self, inputs, predictions, stage):
+        # loss =  predictions['loss_output']
+        return dict(loss_spk=predictions['spk_loss_output'], loss_lang=predictions['lang_loss'])
+        
+        
+    def eval_fn(self, inputs, predictions):   
+        spk_true = inputs['spk_labels'].detach().cpu().tolist()
+        spk_pred = predictions['spk_output'].argmax(dim=-1).detach().cpu().tolist()
+        spk_acc = accuracy_score(y_true=spk_true, y_pred=spk_pred)
+        lang_true = inputs['lang_labels'].detach().cpu().tolist()
+        lang_pred = predictions['lang_output'].argmax(dim=-1).detach().cpu().tolist()
+        lang_acc = accuracy_score(y_true=lang_true, y_pred=lang_pred)
+        
+        return dict(lr=self.optimizer.param_groups[0]['lr'], spk_acc=spk_acc, lang_acc=lang_acc)
+        
+
+    def validate_once(self, epoch_idx):
+        valid_logs = dict()
+        for module in self.modules.values():
+            module.eval()
+        if self.is_distributed:
+            self.valid_dataloader.batch_sampler.set_epoch(epoch_idx)
+
+        valid_embd = torch.zeros(len(self.valid_dataset.scp_list), self.embd_dim).to(self.device)
+        lang_correct = torch.zeros(1, device=self.device)
+        lang_total = torch.zeros(1, device=self.device)
+
+        with torch.autocast('cuda', self.dtype):
+            with torch.no_grad():
+                for inputs in tqdm(self.valid_dataloader):
+                    inputs = self.scatter_data(inputs) 
+                    utt_idx = inputs['utt_labels'].item()
+                    emb_output, lang_output = self.modules['spk_model'](inputs['aud_inputs'])
+                    lang_pred = torch.argmax(lang_output, dim=1)
+                    lang_gt = inputs['lang_labels'].to(lang_pred.device)
+                    lang_correct += (lang_pred == lang_gt).sum()
+                    lang_total += lang_gt.numel()
+                    if len(emb_output.shape) == 2:
+                        valid_embd[utt_idx] = emb_output[0]
+                    else:
+                        valid_embd[utt_idx] = emb_output[0, -1]
+                    
+        if self.is_distributed:
+            dist.all_reduce(valid_embd, op=dist.ReduceOp.SUM)
+            dist.barrier()
+
+        if self.is_distributed:
+            dist.all_reduce(lang_correct, op=dist.ReduceOp.SUM)
+            dist.all_reduce(lang_total, op=dist.ReduceOp.SUM)
+        lang_acc = (lang_correct / (lang_total + 1e-8)).item()
+
+        utt2embd = {}
+        for utt_idx in range(len(self.valid_dataset.scp_list)):
+            k = self.valid_dataset.scp_list[utt_idx]['reco']
+            v = valid_embd[utt_idx].unsqueeze(0).float().detach().cpu().numpy()
+            utt2embd[k] = v
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trial_path = os.path.join(temp_dir, 'valid.trial')
+            save_trial(trial_path, self.valid_dataset.trial_list)
+            eer = get_eer(utt2embd, trial_path)[0]
+            valid_logs = self.update_logs(valid_logs, dict(lr=self.optimizer.param_groups[0]['lr'],eer=eer,dev_acc=lang_acc))
+                
+        return valid_logs
+
+   
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--is_distributed", default=False, type=bool)
+    parser.add_argument("--yaml", type=str, default='')
+    parser.add_argument("--pretrain", type=str, default='')
+    parser.add_argument("--tag", type=str, default='')
+    args = parser.parse_args()
+
+    try:
+        trainer = LocalTrainer(
+            local_rank=int(os.environ["LOCAL_RANK"]) if args.is_distributed else -1,
+            is_distributed=args.is_distributed,
+            yaml_path=args.yaml,
+            exps_tag=args.tag,
+        )
+
+        if args.pretrain:
+            trainer.load_checkpoints(args.pretrain)
+
+        trainer.fit()
+        
+    except Exception:
+        print(traceback.format_exc())
+
+    finally:
+        if args.is_distributed:
+            dist.destroy_process_group()
+
+
+
+
+
+
